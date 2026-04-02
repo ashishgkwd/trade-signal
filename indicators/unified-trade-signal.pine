@@ -1,0 +1,441 @@
+//@version=6
+indicator("Unified Trade Signal", shorttitle="UTS", overlay=true, max_bars_back=500, max_lines_count=500, max_labels_count=500)
+
+// ── Section 1: Inputs ──────────────────────────────────────────────────
+
+// NWE Settings
+float        nwe_h       = input.float(8.0,   title="Bandwidth",  minval=0, group="NWE Settings")
+float        nwe_mult    = input.float(3.0,   title="Multiplier", minval=0, group="NWE Settings")
+series float nwe_src     = input.source(close, title="Source",               group="NWE Settings")
+bool         nwe_repaint = input.bool(true,   title="Repainting Smoothing", group="NWE Settings",
+             tooltip="When enabled, uses the per-bar localized kernel (matches LuxAlgo repainting mode — bands are drawn as line objects). When disabled, uses the stable endpoint method — bands are plot() series, supports historical signal markers.")
+
+// EMA Settings
+int ema_fast = input.int(13, title="Fast EMA Period", minval=1, group="EMA Settings")
+int ema_slow = input.int(48, title="Slow EMA Period", minval=1, group="EMA Settings")
+
+// ATF Settings
+float atf_mult         = input.float(2.0, title="Deviation Multiplier",          minval=0, step=0.1,   group="ATF Settings")
+int   atf_fixed_period = input.int(0,     title="Fixed Period (0 = auto-select)", minval=0, maxval=200, group="ATF Settings",
+                         tooltip="0 = auto-select the period (20–200, step 10) with the highest Pearson's R. Set to a multiple of 10 between 20–200 to bypass auto-selection — use if the script exceeds TradingView's execution time limit.")
+
+// RSI Settings
+int rsi_len      = input.int(14, title="RSI Period",               minval=1,           group="RSI Settings")
+int rsi_lo       = input.int(30, title="Bullish Zone Lower Bound", minval=0, maxval=100, group="RSI Settings")
+int rsi_hi       = input.int(40, title="Bullish Zone Upper Bound", minval=0, maxval=100, group="RSI Settings")
+int rsi_bear_lo  = input.int(60, title="Bearish Zone Lower Bound", minval=0, maxval=100, group="RSI Settings")
+int rsi_bear_hi  = input.int(70, title="Bearish Zone Upper Bound", minval=0, maxval=100, group="RSI Settings")
+int rsi_lookback = input.int(3,  title="RSI Trend Lookback (bars)", minval=1,           group="RSI Settings")
+
+// Display Settings
+bool show_nwe           = input.bool(false, title="Show NWE Bands",                group="Display")
+bool show_ema           = input.bool(false, title="Show EMAs",                     group="Display")
+bool show_atf           = input.bool(false, title="Show ATF Channel",              group="Display")
+bool show_signal_labels = input.bool(true,  title="Show BUY/SELL Labels",          group="Display",
+             tooltip="When enabled, combined signals show BUY/SELL text labels. When disabled, shows triangles only.")
+bool show_nwe_signals   = input.bool(false, title="Show NWE Signals",              group="Display",
+             tooltip="When enabled, plots small markers for NWE crossover signals independently. Useful for validation.")
+bool show_ema_signals   = input.bool(false, title="Show EMA Signals",              group="Display",
+             tooltip="When enabled, plots small labels for EMA crossover signals independently. Useful for validation.")
+bool show_atf_signals   = input.bool(false, title="Show ATF Signals",              group="Display",
+             tooltip="When enabled, plots small labels for ATF direction-change signals independently. Useful for validation.")
+
+// ── Section 2: NWE Calculation ────────────────────────────────────────
+// Two modes controlled by nwe_repaint:
+//
+//   Non-repainting (nwe_repaint=false): endpoint method — Gaussian weights fixed
+//     relative to the most recent bar, precomputed once at bar 0. Produces a stable
+//     per-bar series; ta.crossover() works on all historical bars. Matches LuxAlgo's
+//     non-repainting (dashed) output.
+//
+//   Repainting (nwe_repaint=true): nested O(n²) loop at barstate.islast, computing
+//     a localized kernel estimate for each historical bar. Matches LuxAlgo's repainting
+//     output exactly. Bands drawn as line objects (not plot series). Signal fires on
+//     current bar only (same constraint as ATF).
+//
+// SIGNAL DIRECTION — MEAN-REVERSION (matches LuxAlgo convention):
+//   close crosses BELOW nwe_lower → nwe_bull (price reverting up from oversold)
+//   close crosses ABOVE nwe_upper → nwe_bear (price reverting down from overbought)
+
+gauss(x, h) => math.exp(-(math.pow(x, 2) / (h * h * 2)))
+
+// Endpoint weights — precomputed once at bar 0 (non-repainting mode only)
+var array<float> nwe_coefs = array.new<float>(0)
+var float        nwe_den   = 0.0
+
+if barstate.isfirst and not nwe_repaint
+    for int i = 0 to 499
+        float w = gauss(i, nwe_h)
+        nwe_coefs.push(w)
+    nwe_den := nwe_coefs.sum()
+
+// Per-bar endpoint bands — valid only when nwe_repaint=false; na otherwise.
+// na propagates through ta.crossover → returns false, preventing spurious signals.
+float nwe_val   = na
+float nwe_upper = na
+float nwe_lower = na
+
+if not nwe_repaint
+    float sum_wv = 0.0
+    for int i = 0 to 499
+        sum_wv += nwe_src[i] * nwe_coefs.get(i)
+    nwe_val   := sum_wv / nwe_den
+    float nwe_mae = ta.sma(math.abs(nwe_src - nwe_val), 499) * nwe_mult
+    nwe_upper := nwe_val + nwe_mae
+    nwe_lower := nwe_val - nwe_mae
+
+bool nwe_bull = ta.crossunder(nwe_src, nwe_lower)
+bool nwe_bear = ta.crossover(nwe_src,  nwe_upper)
+
+// Repainting mode: nested O(n²) loop at barstate.islast — mirrors LuxAlgo source exactly.
+// Line and label arrays allow full clear-and-redraw on each bar update.
+// Drawing capped at 490 bars (245 lines/band × 2 + 3 ATF lines = 493 ≤ max_lines_count=500).
+// Historical signal labels are drawn in Section 7 Part A after EMA/ATF/RSI series are computed.
+var float        nwe_rep_sae    = na
+var array<float> nwe_kernel     = array.new<float>(0)
+var array<line>  nwe_rep_upper  = array.new<line>(0)
+var array<line>  nwe_rep_lower  = array.new<line>(0)
+var array<label> nwe_rep_labels = array.new<label>(0)
+
+if barstate.islast and nwe_repaint
+    for ln in nwe_rep_upper
+        line.delete(ln)
+    for ln in nwe_rep_lower
+        line.delete(ln)
+    for lbl in nwe_rep_labels
+        label.delete(lbl)
+    nwe_rep_upper.clear()
+    nwe_rep_lower.clear()
+    nwe_rep_labels.clear()
+    nwe_kernel.clear()
+
+    int   _n   = bar_index
+    int   _lim = math.min(490, _n - 1)
+    float _sae = 0.0
+
+    // Per-bar localized kernel: for each historical bar i, weight by gauss(i-j, h)
+    // centred on bar i — identical to LuxAlgo's repainting nested loop
+    for int i = 0 to _lim
+        float _sum  = 0.0
+        float _sumw = 0.0
+        for int j = 0 to _lim
+            float _w  = gauss(i - j, nwe_h)
+            _sum  += nwe_src[j] * _w
+            _sumw += _w
+        float _y2 = _sum / _sumw
+        _sae += math.abs(nwe_src[i] - _y2)
+        nwe_kernel.push(_y2)
+
+    _sae := _sae / _lim * nwe_mult
+    nwe_rep_sae := _sae
+
+    // Draw every other segment (matches LuxAlgo i%2 pattern).
+    // Current-bar crossover (i==0): nwe_kernel[0]=current, nwe_kernel[1]=previous bar.
+    // Historical labels are drawn in Section 7 after EMA/ATF/RSI series are available.
+    float _y1 = na
+    for int i = 0 to _lim
+        float _y2 = nwe_kernel.get(i)
+        if i % 2 > 0 and show_nwe
+            nwe_rep_upper.push(line.new(_n - i + 1, _y1 + _sae, _n - i, _y2 + _sae, color=color.teal, width=1))
+            nwe_rep_lower.push(line.new(_n - i + 1, _y1 - _sae, _n - i, _y2 - _sae, color=color.red,  width=1))
+        // i==0: set nwe_bull/nwe_bear for plotshape() to fire on the current bar in Section 7
+        if i == 0 and _lim >= 1
+            nwe_bull := nwe_src[0] < nwe_kernel.get(0) - _sae and nwe_src[1] > nwe_kernel.get(1) - _sae
+            nwe_bear := nwe_src[0] > nwe_kernel.get(0) + _sae and nwe_src[1] < nwe_kernel.get(1) + _sae
+        _y1 := _y2
+
+// ── Section 3: EMA Calculation ────────────────────────────────────────
+// Trend bias filter using two EMAs. A position check (fast > slow) is used
+// rather than a crossover — this confirms the current trend bias on every bar,
+// not just the bar the cross occurred on, making it a reliable directional filter.
+
+float fast_ema = ta.ema(close, ema_fast)
+float slow_ema = ta.ema(close, ema_slow)
+
+bool ema_bull = fast_ema > slow_ema
+bool ema_bear = fast_ema < slow_ema
+
+// Crossover events — used only for individual signal labels (not for the combined signal filter)
+bool ema_cross_bull = ta.crossover(fast_ema,  slow_ema)
+bool ema_cross_bear = ta.crossunder(fast_ema, slow_ema)
+
+// ── Section 4: ATF Calculation ────────────────────────────────────────
+// Logarithmic linear regression tested across 19 lookback periods (20–200, step 10).
+// The period with the highest Pearson's R (strongest linear correlation in log-price
+// space) is auto-selected. Set atf_fixed_period > 0 to bypass auto-selection.
+//
+// BARSTATE.ISLAST CONSTRAINT: calcDev() returns [na,na,na,na] on every bar except
+// the last. Consequently atf_bull/atf_bear are only meaningful on the current bar —
+// historical bars carry na slope → atf_bull=false, no past markers will appear.
+// For live bar-close alerts this is correct and intended behaviour.
+//
+// WHY TOP-LEVEL CALLS: all 19 calcDev() invocations must be at the script's top level
+// (not inside an if block) so Pine Script tracks the required history buffers for each
+// period's lookback. The function itself is gated on barstate.islast internally.
+
+calcDev(float source, int length) =>
+    float logSource  = math.log(source)
+    var int period_1 = length - 1           // constant per call site; var avoids recompute
+    if barstate.islast
+        float sumX  = 0.0
+        float sumXX = 0.0
+        float sumYX = 0.0
+        float sumY  = 0.0
+        for int i = 1 to length by 1
+            float lSrc  = logSource[i - 1]
+            sumX  += i
+            sumXX += i * i
+            sumYX += i * lSrc
+            sumY  += lSrc
+        float slope     = nz((length * sumYX - sumX * sumY) / (length * sumXX - sumX * sumX))
+        float average   = sumY / length
+        float intercept = average - slope * sumX / length + slope
+        float sumDev = 0.0
+        float sumDxx = 0.0
+        float sumDyy = 0.0
+        float sumDyx = 0.0
+        float regres = intercept + slope * period_1 * 0.5
+        float sumSlp = intercept
+        for int i = 0 to period_1 by 1
+            float lSrc  = logSource[i]
+            float dxt   = lSrc - average
+            float dyt   = sumSlp - regres
+            lSrc       := lSrc - sumSlp
+            sumSlp     += slope
+            sumDxx     += dxt * dxt
+            sumDyy     += dyt * dyt
+            sumDyx     += dxt * dyt
+            sumDev     += lSrc * lSrc
+        float unStdDev = math.sqrt(sumDev / period_1)
+        float pearsonR = nz(sumDyx / math.sqrt(sumDxx * sumDyy))
+        [unStdDev, pearsonR, slope, intercept]
+    else
+        [na, na, na, na]
+
+// Top-level calls — must remain unconditional for history buffer tracking
+[atf_sd01, atf_r01, atf_sl01, atf_ic01] = calcDev(close,  20)
+[atf_sd02, atf_r02, atf_sl02, atf_ic02] = calcDev(close,  30)
+[atf_sd03, atf_r03, atf_sl03, atf_ic03] = calcDev(close,  40)
+[atf_sd04, atf_r04, atf_sl04, atf_ic04] = calcDev(close,  50)
+[atf_sd05, atf_r05, atf_sl05, atf_ic05] = calcDev(close,  60)
+[atf_sd06, atf_r06, atf_sl06, atf_ic06] = calcDev(close,  70)
+[atf_sd07, atf_r07, atf_sl07, atf_ic07] = calcDev(close,  80)
+[atf_sd08, atf_r08, atf_sl08, atf_ic08] = calcDev(close,  90)
+[atf_sd09, atf_r09, atf_sl09, atf_ic09] = calcDev(close, 100)
+[atf_sd10, atf_r10, atf_sl10, atf_ic10] = calcDev(close, 110)
+[atf_sd11, atf_r11, atf_sl11, atf_ic11] = calcDev(close, 120)
+[atf_sd12, atf_r12, atf_sl12, atf_ic12] = calcDev(close, 130)
+[atf_sd13, atf_r13, atf_sl13, atf_ic13] = calcDev(close, 140)
+[atf_sd14, atf_r14, atf_sl14, atf_ic14] = calcDev(close, 150)
+[atf_sd15, atf_r15, atf_sl15, atf_ic15] = calcDev(close, 160)
+[atf_sd16, atf_r16, atf_sl16, atf_ic16] = calcDev(close, 170)
+[atf_sd17, atf_r17, atf_sl17, atf_ic17] = calcDev(close, 180)
+[atf_sd18, atf_r18, atf_sl18, atf_ic18] = calcDev(close, 190)
+[atf_sd19, atf_r19, atf_sl19, atf_ic19] = calcDev(close, 200)
+
+// Persistent state — only updated at barstate.islast; retains last value on all other bars.
+// atf_intercept and atf_stdDev are stored for use by the overlay line in Task 3.1.
+var float atf_slope     = na
+var float atf_intercept = na
+var float atf_stdDev    = na
+var int   atf_period    = na
+
+if barstate.islast
+    array<float> pearsonRs  = array.from(atf_r01,  atf_r02,  atf_r03,  atf_r04,  atf_r05,  atf_r06,  atf_r07,  atf_r08,  atf_r09,  atf_r10,  atf_r11,  atf_r12,  atf_r13,  atf_r14,  atf_r15,  atf_r16,  atf_r17,  atf_r18,  atf_r19)
+    array<float> slopes     = array.from(atf_sl01, atf_sl02, atf_sl03, atf_sl04, atf_sl05, atf_sl06, atf_sl07, atf_sl08, atf_sl09, atf_sl10, atf_sl11, atf_sl12, atf_sl13, atf_sl14, atf_sl15, atf_sl16, atf_sl17, atf_sl18, atf_sl19)
+    array<float> intercepts = array.from(atf_ic01, atf_ic02, atf_ic03, atf_ic04, atf_ic05, atf_ic06, atf_ic07, atf_ic08, atf_ic09, atf_ic10, atf_ic11, atf_ic12, atf_ic13, atf_ic14, atf_ic15, atf_ic16, atf_ic17, atf_ic18, atf_ic19)
+    array<float> stdDevs    = array.from(atf_sd01, atf_sd02, atf_sd03, atf_sd04, atf_sd05, atf_sd06, atf_sd07, atf_sd08, atf_sd09, atf_sd10, atf_sd11, atf_sd12, atf_sd13, atf_sd14, atf_sd15, atf_sd16, atf_sd17, atf_sd18, atf_sd19)
+    array<int>   periods    = array.from(20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120, 130, 140, 150, 160, 170, 180, 190, 200)
+
+    // Select the period index to use
+    int selectedIdx = pearsonRs.indexof(pearsonRs.max())   // default: auto-select
+
+    if atf_fixed_period > 0
+        int fixedIdx = periods.indexof(atf_fixed_period)
+        // indexof returns -1 if the value is not in the list; fall back to auto-select
+        selectedIdx := fixedIdx >= 0 ? fixedIdx : pearsonRs.indexof(pearsonRs.max())
+
+    atf_slope     := slopes.get(selectedIdx)
+    atf_intercept := intercepts.get(selectedIdx)
+    atf_stdDev    := stdDevs.get(selectedIdx)
+    atf_period    := periods.get(selectedIdx)
+
+// Per-bar slope via ta.linreg — enables signal markers on historical bars.
+// atf_slope (from barstate.islast / calcDev) is used only for the overlay line.
+// Signal uses ta.linreg with a simple-int period so Pine's history buffers are satisfied:
+//   • atf_fixed_period > 0  → use that period on every bar (consistent)
+//   • atf_fixed_period == 0 → use 100 as reference period on historical bars
+//     (the Pearson-R best period only becomes known on the last bar)
+int   atf_sig_period   = atf_fixed_period > 0 ? atf_fixed_period : 100
+float atf_log_close    = math.log(close)
+float atf_slope_series = ta.linreg(atf_log_close, atf_sig_period, 0) -
+                         ta.linreg(atf_log_close, atf_sig_period, 1)
+
+bool atf_bull = atf_slope_series > 0
+bool atf_bear = atf_slope_series < 0
+
+// Direction-change events — slope flips from negative→positive or positive→negative
+bool atf_cross_bull = atf_slope_series > 0 and atf_slope_series[1] <= 0
+bool atf_cross_bear = atf_slope_series < 0 and atf_slope_series[1] >= 0
+
+// ── Section 5: RSI Calculation ────────────────────────────────────────
+// Standard RSI via built-in ta.rsi(). Bullish condition: value in [rsi_lo, rsi_hi]
+// AND rising (confirmed by comparing to rsi_lookback bars ago). Bearish: symmetric
+// mirror using [rsi_bear_lo, rsi_bear_hi] AND falling. Boundary values are inclusive.
+
+float rsi_val = ta.rsi(close, rsi_len)
+
+bool rsi_in_zone      = rsi_val >= rsi_lo     and rsi_val <= rsi_hi
+bool rsi_rising       = rsi_val >  rsi_val[rsi_lookback]
+bool rsi_bull         = rsi_in_zone and rsi_rising
+
+bool rsi_in_bear_zone = rsi_val >= rsi_bear_lo and rsi_val <= rsi_bear_hi
+bool rsi_falling      = rsi_val <  rsi_val[rsi_lookback]
+bool rsi_bear         = rsi_in_bear_zone and rsi_falling
+
+// ── Section 6: Signal Logic ───────────────────────────────────────────
+// All four conditions must be true simultaneously. No partial signals.
+
+bool bull_signal = nwe_bull and ema_bull and atf_bull and rsi_bull
+bool bear_signal = nwe_bear and ema_bear and atf_bear and rsi_bear
+
+// ── Section 7: Plots & Alerts ─────────────────────────────────────────
+
+// ── Part A: Primary signal markers (always visible) ───────────────────
+// Combined signal style matches RSI source indicator: solid colored background,
+// white text, shape.labelup/labeldown at location.absolute — or triangles when labels off.
+plotshape(show_signal_labels and bull_signal, title="Bull Label",
+          style=shape.labelup,      location=location.belowbar,
+          color=color.green, textcolor=color.white, text="BUY", size=size.large)
+plotshape(not show_signal_labels and bull_signal, title="Bull Arrow",
+          style=shape.triangleup,   location=location.belowbar,
+          color=color.green, size=size.large)
+
+plotshape(show_signal_labels and bear_signal, title="Bear Label",
+          style=shape.labeldown,    location=location.abovebar,
+          color=color.red, textcolor=color.white, text="SELL", size=size.large)
+plotshape(not show_signal_labels and bear_signal, title="Bear Arrow",
+          style=shape.triangledown, location=location.abovebar,
+          color=color.red, size=size.large)
+
+bgcolor(bull_signal ? color.new(color.green, 85) : bear_signal ? color.new(color.red, 85) : na,
+        title="Signal Background")
+
+// ── Individual indicator signal labels (shown only when show_indiv_signals = true) ──
+
+// NWE — crossover/crossunder events. Teal triangle below bar (bull) / red triangle above bar (bear).
+plotshape(show_nwe_signals and nwe_bull, title="NWE Bull",
+          style=shape.triangleup,   location=location.belowbar,
+          color=color.teal, size=size.small)
+plotshape(show_nwe_signals and nwe_bear, title="NWE Bear",
+          style=shape.triangledown, location=location.abovebar,
+          color=color.red,  size=size.small)
+
+// EMA — crossover/crossunder events.
+plotshape(show_ema_signals and ema_cross_bull, title="EMA Bull",
+          style=shape.labelup,   location=location.belowbar,
+          color=color.new(color.green, 0), textcolor=color.white, text="BUY", size=size.small)
+plotshape(show_ema_signals and ema_cross_bear, title="EMA Bear",
+          style=shape.labeldown, location=location.abovebar,
+          color=color.new(color.red, 0), textcolor=color.white, text="SELL", size=size.small)
+
+// ATF — direction-change events. Uses purple to match ATF channel color.
+plotshape(show_atf_signals and atf_cross_bull, title="ATF Bull",
+          style=shape.labelup,   location=location.belowbar,
+          color=color.purple, textcolor=color.white, text="ATF", size=size.large)
+plotshape(show_atf_signals and atf_cross_bear, title="ATF Bear",
+          style=shape.labeldown, location=location.abovebar,
+          color=color.purple, textcolor=color.white, text="ATF", size=size.large)
+
+
+// ── Repainting mode: historical NWE signal labels ─────────────────────
+// plotshape() can only reflect the current bar's nwe_bull/nwe_bear value.
+// For historical bars in repainting mode we use label.new() here, after EMA,
+// ATF, and RSI series (Sections 3–5) have been computed for this bar execution.
+if barstate.islast and nwe_repaint
+    int _hn   = bar_index
+    int _hlim = math.min(490, _hn - 1)
+    // i=0 is current bar (handled by plotshape above); i=_hlim needs i+1 → cap at _hlim-1
+    for int i = 1 to _hlim - 1
+        bool _nwe_bull_i = nwe_src[i] < nwe_kernel.get(i) - nwe_rep_sae and nwe_src[i + 1] > nwe_kernel.get(i + 1) - nwe_rep_sae
+        bool _nwe_bear_i = nwe_src[i] > nwe_kernel.get(i) + nwe_rep_sae and nwe_src[i + 1] < nwe_kernel.get(i + 1) + nwe_rep_sae
+        if show_nwe_signals and _nwe_bull_i
+            nwe_rep_labels.push(label.new(_hn - i, low[i], "▲",
+                color=color.new(color.white, 100), style=label.style_label_up,
+                textcolor=color.green, textalign=text.align_center, size=size.large))
+        if show_nwe_signals and _nwe_bear_i
+            nwe_rep_labels.push(label.new(_hn - i, high[i], "▼",
+                color=color.new(color.white, 100), style=label.style_label_down,
+                textcolor=color.red, textalign=text.align_center, size=size.large))
+        bool _ema_bull_i = fast_ema[i] > slow_ema[i]
+        bool _ema_bear_i = fast_ema[i] < slow_ema[i]
+        bool _atf_bull_i = atf_slope_series[i] > 0
+        bool _atf_bear_i = atf_slope_series[i] < 0
+        bool _rsi_bull_i = rsi_val[i] >= rsi_lo     and rsi_val[i] <= rsi_hi      and rsi_val[i] > rsi_val[i + rsi_lookback]
+        bool _rsi_bear_i = rsi_val[i] >= rsi_bear_lo and rsi_val[i] <= rsi_bear_hi and rsi_val[i] < rsi_val[i + rsi_lookback]
+        if _nwe_bull_i and _ema_bull_i and _atf_bull_i and _rsi_bull_i
+            string _bull_text = show_signal_labels ? "BUY" : "▲"
+            nwe_rep_labels.push(label.new(_hn - i, low[i], _bull_text,
+                color=color.green, style=label.style_label_up,
+                textcolor=color.white, textalign=text.align_center, size=size.large))
+        if _nwe_bear_i and _ema_bear_i and _atf_bear_i and _rsi_bear_i
+            string _bear_text = show_signal_labels ? "SELL" : "▼"
+            nwe_rep_labels.push(label.new(_hn - i, high[i], _bear_text,
+                color=color.red, style=label.style_label_down,
+                textcolor=color.white, textalign=text.align_center, size=size.large))
+
+// ── Part B: Alert conditions (Task 2.1) ───────────────────────────────
+
+// (Implementation: Task 2.1)
+
+// ── Part C: Overlay lines (individually toggled) ──────────────────────
+// NWE: plot() series only in non-repainting mode; repainting mode uses line objects above
+plot(show_nwe and not nwe_repaint ? nwe_upper : na, "NWE Upper", color=color.teal, linewidth=1)
+plot(show_nwe and not nwe_repaint ? nwe_lower : na, "NWE Lower", color=color.red,  linewidth=1)
+plot(show_ema ? fast_ema  : na, "EMA 13",    color=color.orange, linewidth=1)
+plot(show_ema ? slow_ema  : na, "EMA 48",    color=color.blue,   linewidth=1)
+
+// ATF channel: midline + upper/lower deviation bands drawn as line objects.
+// Start point shifts each bar so line objects are used (not plot series).
+// Channel width = atf_mult * atf_stdDev in log-price space (same as source indicator).
+var line atf_midline    = na
+var line atf_upper_line = na
+var line atf_lower_line = na
+if barstate.islast
+    float _start_price = math.exp(atf_intercept + atf_slope * (atf_period - 1))
+    float _end_price   = math.exp(atf_intercept)
+    int   _start_bar   = bar_index - atf_period + 1
+    float _dev         = atf_mult * atf_stdDev
+    float _upper_start = _start_price * math.exp(_dev)
+    float _upper_end   = _end_price   * math.exp(_dev)
+    float _lower_start = _start_price / math.exp(_dev)
+    float _lower_end   = _end_price   / math.exp(_dev)
+    if show_atf
+        if na(atf_midline)
+            atf_midline    := line.new(_start_bar, _start_price, bar_index, _end_price,
+                                       color=color.purple, width=2)
+            atf_upper_line := line.new(_start_bar, _upper_start, bar_index, _upper_end,
+                                       color=color.new(color.purple, 50), width=1)
+            atf_lower_line := line.new(_start_bar, _lower_start, bar_index, _lower_end,
+                                       color=color.new(color.purple, 50), width=1)
+        else
+            line.set_xy1(atf_midline,    _start_bar, _start_price)
+            line.set_xy2(atf_midline,    bar_index,  _end_price)
+            line.set_xy1(atf_upper_line, _start_bar, _upper_start)
+            line.set_xy2(atf_upper_line, bar_index,  _upper_end)
+            line.set_xy1(atf_lower_line, _start_bar, _lower_start)
+            line.set_xy2(atf_lower_line, bar_index,  _lower_end)
+    else
+        if not na(atf_midline)
+            line.delete(atf_midline)
+            atf_midline := na
+        if not na(atf_upper_line)
+            line.delete(atf_upper_line)
+            atf_upper_line := na
+        if not na(atf_lower_line)
+            line.delete(atf_lower_line)
+            atf_lower_line := na
+
+// ── Part D: RSI corner table (Task 3.2) ───────────────────────────────
+
+// (Implementation: Task 3.2)

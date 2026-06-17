@@ -20,6 +20,7 @@ int   atf_fixed_period = input.int(0,     title="Fixed Period (0 = auto-select)"
                          tooltip="0 = auto-select the period (20–200, step 10) with the highest Pearson's R. Set to a multiple of 10 between 20–200 to bypass auto-selection — use if the script exceeds TradingView's execution time limit.")
 
 // RSI Settings
+bool use_rsi     = input.bool(true, title="Include RSI in Signal", group="RSI Settings")
 int rsi_len      = input.int(14, title="RSI Period",               minval=1,           group="RSI Settings")
 int rsi_lo       = input.int(30, title="Bullish Zone Lower Bound", minval=0, maxval=100, group="RSI Settings")
 int rsi_hi       = input.int(40, title="Bullish Zone Upper Bound", minval=0, maxval=100, group="RSI Settings")
@@ -296,8 +297,8 @@ bool rsi_bear         = rsi_in_bear_zone and rsi_falling
 // ── Section 6: Signal Logic ───────────────────────────────────────────
 // All four conditions must be true simultaneously. No partial signals.
 
-bool bull_signal = nwe_bull and ema_bull and atf_bull and rsi_bull
-bool bear_signal = nwe_bear and ema_bear and atf_bear and rsi_bear
+bool bull_signal = nwe_bull and ema_bull and atf_bull and (not use_rsi or rsi_bull)
+bool bear_signal = nwe_bear and ema_bear and atf_bear and (not use_rsi or rsi_bear)
 
 // ── Section 7: Plots & Alerts ─────────────────────────────────────────
 
@@ -373,12 +374,12 @@ if barstate.islast and nwe_repaint
         bool _atf_bear_i = atf_slope_series[i] < 0
         bool _rsi_bull_i = rsi_val[i] >= rsi_lo     and rsi_val[i] <= rsi_hi      and rsi_val[i] > rsi_val[i + rsi_lookback]
         bool _rsi_bear_i = rsi_val[i] >= rsi_bear_lo and rsi_val[i] <= rsi_bear_hi and rsi_val[i] < rsi_val[i + rsi_lookback]
-        if _nwe_bull_i and _ema_bull_i and _atf_bull_i and _rsi_bull_i
+        if _nwe_bull_i and _ema_bull_i and _atf_bull_i and (not use_rsi or _rsi_bull_i)
             string _bull_text = show_signal_labels ? "BUY" : "▲"
             nwe_rep_labels.push(label.new(_hn - i, low[i], _bull_text,
                 color=color.green, style=label.style_label_up,
                 textcolor=color.white, textalign=text.align_center, size=size.large))
-        if _nwe_bear_i and _ema_bear_i and _atf_bear_i and _rsi_bear_i
+        if _nwe_bear_i and _ema_bear_i and _atf_bear_i and (not use_rsi or _rsi_bear_i)
             string _bear_text = show_signal_labels ? "SELL" : "▼"
             nwe_rep_labels.push(label.new(_hn - i, high[i], _bear_text,
                 color=color.red, style=label.style_label_down,

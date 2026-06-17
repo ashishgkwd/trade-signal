@@ -1,0 +1,235 @@
+//@version=6
+strategy("Unified Trade Strategy", shorttitle="UTS Strategy", overlay=true,
+         max_bars_back=500,
+         initial_capital=100000,
+         default_qty_type=strategy.percent_of_equity,
+         default_qty_value=10,
+         commission_type=strategy.commission.percent,
+         commission_value=0.05,
+         slippage=1,
+         process_orders_on_close=true,
+         calc_on_every_tick=false,
+         pyramiding=0)
+
+// ── Section 1: Inputs ──────────────────────────────────────────────────
+
+// NWE Settings
+float        nwe_h   = input.float(8.0,   title="Bandwidth",  minval=0, group="NWE Settings")
+float        nwe_mult = input.float(3.0,   title="Multiplier", minval=0, group="NWE Settings")
+series float nwe_src  = input.source(close, title="Source",               group="NWE Settings")
+
+// EMA Settings
+int ema_fast = input.int(13, title="Fast EMA Period", minval=1, group="EMA Settings")
+int ema_slow = input.int(48, title="Slow EMA Period", minval=1, group="EMA Settings")
+
+// ATF Settings
+float atf_mult       = input.float(2.0, title="Deviation Multiplier", minval=0, step=0.1, group="ATF Settings")
+int   atf_period     = input.int(100,   title="Lookback Period",      minval=20, maxval=200, step=10, group="ATF Settings",
+                       tooltip="Period for log-regression slope. Experiment with values 20–200 (step 10) during backtesting.")
+
+// RSI Settings
+bool use_rsi     = input.bool(true, title="Include RSI in Signal", group="RSI Settings")
+int rsi_len      = input.int(14, title="RSI Period",               minval=1,           group="RSI Settings")
+int rsi_lo       = input.int(30, title="Bullish Zone Lower Bound", minval=0, maxval=100, group="RSI Settings")
+int rsi_hi       = input.int(40, title="Bullish Zone Upper Bound", minval=0, maxval=100, group="RSI Settings")
+int rsi_bear_lo  = input.int(60, title="Bearish Zone Lower Bound", minval=0, maxval=100, group="RSI Settings")
+int rsi_bear_hi  = input.int(70, title="Bearish Zone Upper Bound", minval=0, maxval=100, group="RSI Settings")
+int rsi_lookback = input.int(3,  title="RSI Trend Lookback (bars)", minval=1,           group="RSI Settings")
+
+// Display Settings
+bool show_nwe           = input.bool(false, title="Show NWE Bands",       group="Display")
+bool show_ema           = input.bool(false, title="Show EMAs",            group="Display")
+bool show_signal_labels = input.bool(true,  title="Show BUY/SELL Labels", group="Display",
+             tooltip="When enabled, combined signals show BUY/SELL text labels. When disabled, shows triangles only.")
+bool show_nwe_signals   = input.bool(false, title="Show NWE Signals",     group="Display",
+             tooltip="When enabled, plots small markers for NWE crossover signals independently.")
+bool show_ema_signals   = input.bool(false, title="Show EMA Signals",     group="Display",
+             tooltip="When enabled, plots small labels for EMA crossover signals independently.")
+bool show_atf_signals   = input.bool(false, title="Show ATF Signals",     group="Display",
+             tooltip="When enabled, plots small labels for ATF direction-change signals independently.")
+
+// Strategy Settings
+string trade_dir  = input.string("Both", title="Trade Direction", options=["Long", "Short", "Both"], group="Strategy Settings")
+bool   use_sl     = input.bool(false, title="Use Stop-Loss",     group="Strategy Settings")
+float  sl_pct     = input.float(5.0,  title="Stop-Loss %",       minval=0.1, step=0.5, group="Strategy Settings",
+                    tooltip="Percentage below entry for longs, above for shorts.")
+bool   use_tp     = input.bool(false, title="Use Take-Profit",   group="Strategy Settings")
+float  tp_pct     = input.float(10.0, title="Take-Profit %",     minval=0.1, step=0.5, group="Strategy Settings",
+                    tooltip="Percentage above entry for longs, below for shorts.")
+bool   use_trail  = input.bool(false, title="Use Trailing Stop",  group="Strategy Settings")
+float  trail_pct  = input.float(3.0,  title="Trail Offset %",     minval=0.1, step=0.5, group="Strategy Settings")
+int    start_date = input.time(timestamp("01 Jan 2020 00:00"), title="Start Date", group="Strategy Settings")
+int    end_date   = input.time(timestamp("31 Dec 2170 23:59"), title="End Date",   group="Strategy Settings")
+
+// ── Section 2: NWE Calculation ────────────────────────────────────────
+// Endpoint (non-repainting) method — Gaussian weights fixed relative to the
+// most recent bar, precomputed once at bar 0. Produces a stable per-bar series;
+// ta.crossover() works on all historical bars.
+//
+// SIGNAL DIRECTION — MEAN-REVERSION (matches LuxAlgo convention):
+//   close crosses BELOW nwe_lower → nwe_bull (price reverting up from oversold)
+//   close crosses ABOVE nwe_upper → nwe_bear (price reverting down from overbought)
+
+gauss(x, h) => math.exp(-(math.pow(x, 2) / (h * h * 2)))
+
+var array<float> nwe_coefs = array.new<float>(0)
+var float        nwe_den   = 0.0
+
+if barstate.isfirst
+    for int i = 0 to 499
+        float w = gauss(i, nwe_h)
+        nwe_coefs.push(w)
+    nwe_den := nwe_coefs.sum()
+
+float nwe_val   = na
+float nwe_upper = na
+float nwe_lower = na
+
+float sum_wv = 0.0
+for int i = 0 to 499
+    sum_wv += nwe_src[i] * nwe_coefs.get(i)
+nwe_val   := sum_wv / nwe_den
+float nwe_mae = ta.sma(math.abs(nwe_src - nwe_val), 499) * nwe_mult
+nwe_upper := nwe_val + nwe_mae
+nwe_lower := nwe_val - nwe_mae
+
+bool nwe_bull = ta.crossunder(nwe_src, nwe_lower)
+bool nwe_bear = ta.crossover(nwe_src,  nwe_upper)
+
+// ── Section 3: EMA Calculation ────────────────────────────────────────
+
+float fast_ema = ta.ema(close, ema_fast)
+float slow_ema = ta.ema(close, ema_slow)
+
+bool ema_bull = fast_ema > slow_ema
+bool ema_bear = fast_ema < slow_ema
+
+bool ema_cross_bull = ta.crossover(fast_ema,  slow_ema)
+bool ema_cross_bear = ta.crossunder(fast_ema, slow_ema)
+
+// ── Section 4: ATF Calculation ────────────────────────────────────────
+// Per-bar slope via ta.linreg in log-price space. Uses fixed lookback period.
+
+float atf_log_close    = math.log(close)
+float atf_slope_series = ta.linreg(atf_log_close, atf_period, 0) -
+                         ta.linreg(atf_log_close, atf_period, 1)
+
+bool atf_bull = atf_slope_series > 0
+bool atf_bear = atf_slope_series < 0
+
+bool atf_cross_bull = atf_slope_series > 0 and atf_slope_series[1] <= 0
+bool atf_cross_bear = atf_slope_series < 0 and atf_slope_series[1] >= 0
+
+// ── Section 5: RSI Calculation ────────────────────────────────────────
+
+float rsi_val = ta.rsi(close, rsi_len)
+
+bool rsi_in_zone      = rsi_val >= rsi_lo     and rsi_val <= rsi_hi
+bool rsi_rising       = rsi_val >  rsi_val[rsi_lookback]
+bool rsi_bull         = rsi_in_zone and rsi_rising
+
+bool rsi_in_bear_zone = rsi_val >= rsi_bear_lo and rsi_val <= rsi_bear_hi
+bool rsi_falling      = rsi_val <  rsi_val[rsi_lookback]
+bool rsi_bear         = rsi_in_bear_zone and rsi_falling
+
+// ── Section 6: Signal Logic ───────────────────────────────────────────
+
+bool in_date_range = time >= start_date and time <= end_date
+bool long_ok       = trade_dir == "Long"  or trade_dir == "Both"
+bool short_ok      = trade_dir == "Short" or trade_dir == "Both"
+
+bool bull_signal = nwe_bull and ema_bull and atf_bull and (not use_rsi or rsi_bull)
+bool bear_signal = nwe_bear and ema_bear and atf_bear and (not use_rsi or rsi_bear)
+
+// ── Section 7: Strategy Orders ────────────────────────────────────────
+
+if bull_signal and in_date_range and long_ok
+    strategy.entry("Long", strategy.long)
+
+if bear_signal and in_date_range and short_ok
+    strategy.entry("Short", strategy.short)
+
+if bear_signal and in_date_range and not short_ok and strategy.position_size > 0
+    strategy.close("Long", comment="Bear signal")
+
+if bull_signal and in_date_range and not long_ok and strategy.position_size < 0
+    strategy.close("Short", comment="Bull signal")
+
+if strategy.position_size > 0 and (use_sl or use_tp or use_trail)
+    float _sl = use_sl ? strategy.position_avg_price * (1 - sl_pct / 100) : na
+    float _tp = use_tp ? strategy.position_avg_price * (1 + tp_pct / 100) : na
+    float _trail = use_trail ? close * trail_pct / 100 / syminfo.mintick : na
+    strategy.exit("Long Exit", "Long", stop=_sl, limit=_tp,
+                  trail_points=use_trail ? _trail : na,
+                  trail_offset=use_trail ? _trail : na)
+
+if strategy.position_size < 0 and (use_sl or use_tp or use_trail)
+    float _sl = use_sl ? strategy.position_avg_price * (1 + sl_pct / 100) : na
+    float _tp = use_tp ? strategy.position_avg_price * (1 - tp_pct / 100) : na
+    float _trail = use_trail ? close * trail_pct / 100 / syminfo.mintick : na
+    strategy.exit("Short Exit", "Short", stop=_sl, limit=_tp,
+                  trail_points=use_trail ? _trail : na,
+                  trail_offset=use_trail ? _trail : na)
+
+if not in_date_range and strategy.position_size != 0
+    strategy.close_all(comment="Out of date range")
+
+// ── Section 8: Plots & Visuals ────────────────────────────────────────
+
+plotshape(show_signal_labels and bull_signal, title="Bull Label",
+          style=shape.labelup,      location=location.belowbar,
+          color=color.green, textcolor=color.white, text="BUY", size=size.large)
+plotshape(not show_signal_labels and bull_signal, title="Bull Arrow",
+          style=shape.triangleup,   location=location.belowbar,
+          color=color.green, size=size.large)
+
+plotshape(show_signal_labels and bear_signal, title="Bear Label",
+          style=shape.labeldown,    location=location.abovebar,
+          color=color.red, textcolor=color.white, text="SELL", size=size.large)
+plotshape(not show_signal_labels and bear_signal, title="Bear Arrow",
+          style=shape.triangledown, location=location.abovebar,
+          color=color.red, size=size.large)
+
+bgcolor(bull_signal ? color.new(color.green, 85) : bear_signal ? color.new(color.red, 85) : na,
+        title="Signal Background")
+
+// NWE signals
+plotshape(show_nwe_signals and nwe_bull, title="NWE Bull",
+          style=shape.triangleup,   location=location.belowbar,
+          color=color.teal, size=size.small)
+plotshape(show_nwe_signals and nwe_bear, title="NWE Bear",
+          style=shape.triangledown, location=location.abovebar,
+          color=color.red,  size=size.small)
+
+// EMA signals
+plotshape(show_ema_signals and ema_cross_bull, title="EMA Bull",
+          style=shape.labelup,   location=location.belowbar,
+          color=color.new(color.green, 0), textcolor=color.white, text="BUY", size=size.small)
+plotshape(show_ema_signals and ema_cross_bear, title="EMA Bear",
+          style=shape.labeldown, location=location.abovebar,
+          color=color.new(color.red, 0), textcolor=color.white, text="SELL", size=size.small)
+
+// ATF signals
+plotshape(show_atf_signals and atf_cross_bull, title="ATF Bull",
+          style=shape.labelup,   location=location.belowbar,
+          color=color.purple, textcolor=color.white, text="ATF ▲", size=size.large)
+plotshape(show_atf_signals and atf_cross_bear, title="ATF Bear",
+          style=shape.labeldown, location=location.abovebar,
+          color=color.purple, textcolor=color.white, text="ATF ▼", size=size.large)
+
+// NWE band overlay
+plot(show_nwe ? nwe_upper : na, "NWE Upper", color=color.teal, linewidth=1)
+plot(show_nwe ? nwe_lower : na, "NWE Lower", color=color.red,  linewidth=1)
+
+// EMA overlay
+plot(show_ema ? fast_ema : na, "EMA 13", color=color.orange, linewidth=1)
+plot(show_ema ? slow_ema : na, "EMA 48", color=color.blue,   linewidth=1)
+
+// ── Section 9: Alerts ─────────────────────────────────────────────────
+
+if bull_signal and in_date_range
+    alert("Bullish signal: NWE crossunder lower, EMA 13 > 48, ATF uptrend" +
+          (use_rsi ? ", RSI 30-40 rising" : ""), alert.freq_once_per_bar_close)
+if bear_signal and in_date_range
+    alert("Bearish signal: NWE crossover upper, EMA 13 < 48, ATF downtrend" +
+          (use_rsi ? ", RSI 60-70 falling" : ""), alert.freq_once_per_bar_close)

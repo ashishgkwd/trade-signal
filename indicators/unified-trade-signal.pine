@@ -343,10 +343,10 @@ plotshape(show_ema_signals and ema_cross_bear, title="EMA Bear",
 // ATF — direction-change events. Uses purple to match ATF channel color.
 plotshape(show_atf_signals and atf_cross_bull, title="ATF Bull",
           style=shape.labelup,   location=location.belowbar,
-          color=color.purple, textcolor=color.white, text="ATF", size=size.large)
+          color=color.purple, textcolor=color.white, text="ATF ▲", size=size.large)
 plotshape(show_atf_signals and atf_cross_bear, title="ATF Bear",
           style=shape.labeldown, location=location.abovebar,
-          color=color.purple, textcolor=color.white, text="ATF", size=size.large)
+          color=color.purple, textcolor=color.white, text="ATF ▼", size=size.large)
 
 
 // ── Repainting mode: historical NWE signal labels ─────────────────────

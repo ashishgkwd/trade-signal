@@ -399,9 +399,11 @@ plot(show_ema ? slow_ema  : na, "EMA 48",    color=color.blue,   linewidth=1)
 // ATF channel: midline + upper/lower deviation bands drawn as line objects.
 // Start point shifts each bar so line objects are used (not plot series).
 // Channel width = atf_mult * atf_stdDev in log-price space (same as source indicator).
-var line atf_midline    = na
-var line atf_upper_line = na
-var line atf_lower_line = na
+var line     atf_midline    = na
+var line     atf_upper_line = na
+var line     atf_lower_line = na
+var linefill atf_upper_fill = na
+var linefill atf_lower_fill = na
 if barstate.islast
     float _start_price = math.exp(atf_intercept + atf_slope * (atf_period - 1))
     float _end_price   = math.exp(atf_intercept)
@@ -419,6 +421,8 @@ if barstate.islast
                                        color=color.new(color.purple, 50), width=1)
             atf_lower_line := line.new(_start_bar, _lower_start, bar_index, _lower_end,
                                        color=color.new(color.purple, 50), width=1)
+            atf_upper_fill := linefill.new(atf_upper_line, atf_midline,    color=color.new(color.purple, 90))
+            atf_lower_fill := linefill.new(atf_midline,    atf_lower_line, color=color.new(color.purple, 90))
         else
             line.set_xy1(atf_midline,    _start_bar, _start_price)
             line.set_xy2(atf_midline,    bar_index,  _end_price)
@@ -427,6 +431,12 @@ if barstate.islast
             line.set_xy1(atf_lower_line, _start_bar, _lower_start)
             line.set_xy2(atf_lower_line, bar_index,  _lower_end)
     else
+        if not na(atf_upper_fill)
+            linefill.delete(atf_upper_fill)
+            atf_upper_fill := na
+        if not na(atf_lower_fill)
+            linefill.delete(atf_lower_fill)
+            atf_lower_fill := na
         if not na(atf_midline)
             line.delete(atf_midline)
             atf_midline := na

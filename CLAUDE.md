@@ -36,7 +36,7 @@ Bullish = NWE_crossover  AND EMA(13) > EMA(48) AND ATF_positive_slope AND RSI in
 Bearish = NWE_crossunder AND EMA(13) < EMA(48) AND ATF_negative_slope AND RSI in [60,70] falling
 ```
 
-**NWE signal direction is inverted from LuxAlgo default** — this script uses breakout interpretation (close crosses above upper band = bullish), not mean-reversion.
+**NWE signal direction matches LuxAlgo default** — mean-reversion interpretation (close crosses below lower band = bullish/oversold reversal, close crosses above upper band = bearish/overbought reversal).
 
 ## Key Design Decisions (from PRD.md)
 
